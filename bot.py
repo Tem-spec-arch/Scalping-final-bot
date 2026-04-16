@@ -3,7 +3,6 @@ import pandas as pd
 from datetime import datetime
 from pybit.unified_trading import HTTP
 
-# === CONFIG ===
 API_KEY = "YOUR_API_KEY"
 API_SECRET = "YOUR_API_SECRET"
 
@@ -18,100 +17,98 @@ PAIRS = [
     "AAVEUSDT","EOSUSDT","THETAUSDT","ALGOUSDT","VETUSDT"
 ]
 
+BATCH_SIZE = 4
 TIMEFRAME = "3"
 LEVERAGE = 70
-TRADE_SIZE = 2
+TRADE_SIZE = 8
 MAX_TRADES = 10
 DAILY_DD_LIMIT = 0.40
 
-# === STATE ===
 start_balance = None
 current_day = datetime.utcnow().day
 trading_paused = False
 last_trade_time = {}
+pair_index = 0
 
-# === HELPERS ===
-def get_balance():
-    bal = session.get_wallet_balance(accountType="UNIFIED")
-    return float(bal["result"]["list"][0]["totalEquity"])
-
-def get_positions():
-    pos = session.get_positions(category="linear")
-    return {p["symbol"]: p for p in pos["result"]["list"] if float(p["size"]) > 0}
-
+# === INSTRUMENT INFO (Fix 1 & 2) ===
 def get_instruments():
     data = session.get_instruments_info(category="linear")
     info = {}
     for item in data["result"]["list"]:
         info[item["symbol"]] = {
-            "qty_step": float(item["lotSizeFilter"]["qtyStep"]),
-            "tick_size": float(item["priceFilter"]["tickSize"])
+            "tick": float(item["priceFilter"]["tickSize"]),
+            "step": float(item["lotSizeFilter"]["qtyStep"]),
+            "min_qty": float(item["lotSizeFilter"]["minOrderQty"])
         }
     return info
 
-INSTRUMENTS = get_instruments()
+INSTR = get_instruments()
 
-def format_qty(symbol, qty):
-    step = INSTRUMENTS[symbol]["qty_step"]
-    return round(qty / step) * step
-
-def format_price(symbol, price):
-    tick = INSTRUMENTS[symbol]["tick_size"]
+def round_price(symbol, price):
+    tick = INSTR[symbol]["tick"]
     return round(price / tick) * tick
 
+def round_qty(symbol, qty):
+    step = INSTR[symbol]["step"]
+    return round(qty / step) * step
+
+# === SAFE API CALL (Fix 3) ===
+def safe_call(func, *args, **kwargs):
+    try:
+        return func(*args, **kwargs)
+    except:
+        return None
+
+def get_balance():
+    res = safe_call(session.get_wallet_balance, accountType="UNIFIED")
+    if res:
+        return float(res["result"]["list"][0]["totalEquity"])
+    return None
+
+def get_positions():
+    res = safe_call(session.get_positions, category="linear")
+    if not res:
+        return {}
+    return {p["symbol"]: p for p in res["result"]["list"] if float(p["size"]) > 0}
+
 def get_data(symbol):
-    k = session.get_kline(category="linear", symbol=symbol, interval=TIMEFRAME, limit=50)
-    df = pd.DataFrame(k["result"]["list"])
+    res = safe_call(session.get_kline, category="linear", symbol=symbol, interval=TIMEFRAME, limit=25)
+    if not res:
+        return None
+    df = pd.DataFrame(res["result"]["list"])
     df.columns = ["time","open","high","low","close","volume","turnover"]
-    df[["open","close"]] = df[["open","close"]].astype(float)
+    df[["open","close","high","low"]] = df[["open","close","high","low"]].astype(float)
     return df
 
-def bollinger(df):
+# === SIGNAL ===
+def check_signal(df):
     df["ma"] = df["close"].rolling(20).mean()
     df["std"] = df["close"].rolling(20).std()
     df["upper"] = df["ma"] + (2 * df["std"])
     df["lower"] = df["ma"] - (2 * df["std"])
-    return df
 
-def check_signal(df):
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    if prev["close"] < prev["lower"] and last["close"] > last["lower"]:
-        if last["close"] > last["open"]:
-            return "buy", last["close"], last["upper"]
+    if ((prev["close"] <= prev["lower"] or prev["low"] <= prev["lower"]) and
+        last["close"] > last["lower"] and last["close"] > last["open"]):
+        return "buy", last["close"], last["upper"]
 
-    if prev["close"] > prev["upper"] and last["close"] < last["upper"]:
-        if last["close"] < last["open"]:
-            return "sell", last["close"], last["lower"]
+    if ((prev["close"] >= prev["upper"] or prev["high"] >= prev["upper"]) and
+        last["close"] < last["upper"] and last["close"] < last["open"]):
+        return "sell", last["close"], last["lower"]
 
     return None, None, None
 
-def set_leverage(symbol):
-    try:
-        session.set_leverage(
-            category="linear",
-            symbol=symbol,
-            buyLeverage=str(LEVERAGE),
-            sellLeverage=str(LEVERAGE)
-        )
-    except:
-        pass
-
+# === TRADE ===
 def place_trade(symbol, side, entry, tp):
-    set_leverage(symbol)
+    raw_qty = (TRADE_SIZE * LEVERAGE) / entry
+    qty = round_qty(symbol, raw_qty)
 
-    position_value = TRADE_SIZE * LEVERAGE
-    qty = position_value / entry
-    qty = format_qty(symbol, qty)
+    if qty < INSTR[symbol]["min_qty"]:
+        return  # skip invalid size
 
-    if side == "buy":
-        sl = entry * (1 - 0.0025)
-    else:
-        sl = entry * (1 + 0.0025)
-
-    sl = format_price(symbol, sl)
-    tp = format_price(symbol, tp)
+    sl = entry * (1 - 0.002) if side == "buy" else entry * (1 + 0.002)
 
     session.place_order(
         category="linear",
@@ -119,68 +116,60 @@ def place_trade(symbol, side, entry, tp):
         side="Buy" if side == "buy" else "Sell",
         orderType="Market",
         qty=qty,
-        takeProfit=tp,
-        stopLoss=sl
+        takeProfit=round_price(symbol, tp),
+        stopLoss=round_price(symbol, sl)
     )
 
     last_trade_time[symbol] = time.time()
 
-    print(f"{symbol} | {side.upper()} | Qty:{qty} | TP:{tp} | SL:{sl}")
-
-# === MAIN LOOP ===
+# === LOOP ===
 while True:
     try:
         now = datetime.utcnow()
 
-        # New day reset
         if now.day != current_day:
             current_day = now.day
             start_balance = get_balance()
             trading_paused = False
-            print("New trading day")
 
         if start_balance is None:
             start_balance = get_balance()
 
-        current_balance = get_balance()
-
-        # Drawdown control
-        dd = (start_balance - current_balance) / start_balance
-        if dd >= DAILY_DD_LIMIT:
-            trading_paused = True
-            print("🚨 40% DD reached. Trading paused.")
+        balance = get_balance()
+        if balance:
+            dd = (start_balance - balance) / start_balance
+            if dd >= DAILY_DD_LIMIT:
+                trading_paused = True
 
         if trading_paused:
-            time.sleep(30)
+            time.sleep(15)
             continue
 
         positions = get_positions()
 
         if len(positions) < MAX_TRADES:
+            batch = PAIRS[pair_index:pair_index+BATCH_SIZE]
+            pair_index = (pair_index+BATCH_SIZE) % len(PAIRS)
 
-            for pair in PAIRS:
-
-                positions = get_positions()
-                if len(positions) >= MAX_TRADES:
-                    break
-
+            for pair in batch:
                 if pair in positions:
+                    continue
+                if pair in last_trade_time and time.time() - last_trade_time[pair] < 180:
                     continue
 
                 df = get_data(pair)
-                df = bollinger(df)
+                if df is None:
+                    continue
 
                 signal, entry, tp = check_signal(df)
 
                 if signal:
-                    if pair in last_trade_time and time.time() - last_trade_time[pair] < 60:
-                        continue
-
                     place_trade(pair, signal, entry, tp)
                     time.sleep(2)
 
-        time.sleep(10)
+                time.sleep(0.3)
 
-    except Exception as e:
-        print("Error:", e)
-        time.sleep(10)
+        time.sleep(12)
+
+    except Exception:
+        time.sleep(15)
